@@ -602,11 +602,55 @@
       return 0;
     }
 
-    function sortBrowserItems(items) {
+    var SORT_STORAGE_KEY = "yacreader.webui.sort";
+
+    function getSortMode() {
+      try {
+        return localStorage.getItem(SORT_STORAGE_KEY) || "default";
+      } catch (error) {
+        return "default";
+      }
+    }
+
+    function setSortMode(mode) {
+      try {
+        localStorage.setItem(SORT_STORAGE_KEY, mode);
+      } catch (error) {
+      }
+    }
+
+    function itemTimestamp(item, field) {
+      var value = Number(item[field]);
+      return Number.isFinite(value) ? value : 0;
+    }
+
+    function itemSortName(item) {
+      return item.folder_name || item.title || item.file_name || "";
+    }
+
+    function sortBrowserItems(items, mode) {
+      mode = mode || "default";
+      var parts = mode.split("_");          // e.g. ["added", "desc"]
+      var field = parts[0];
+      var direction = parts[1] === "asc" ? 1 : -1;
+
       return items.map(function (item, index) {
         return { item: item, index: index };
       }).sort(function (left, right) {
-        return compareBrowserItems(left.item, right.item) || left.index - right.index;
+        var a = left.item;
+        var b = right.item;
+        var result = 0;
+
+        // Keep folders grouped ahead of comics, as the default order does.
+        if (mode !== "default" && a.type === b.type) {
+          if (field === "added" || field === "updated") {
+            result = (itemTimestamp(a, field) - itemTimestamp(b, field)) * direction;
+          } else if (field === "name") {
+            result = naturalBrowserCompare(itemSortName(a), itemSortName(b)) * (parts[1] === "desc" ? -1 : 1);
+          }
+        }
+
+        return result || compareBrowserItems(a, b) || left.index - right.index;
       }).map(function (entry) {
         return entry.item;
       });
@@ -1732,6 +1776,143 @@
       return parts;
     }
 
+    function readingListsApi() {
+      return "/v2/library/" + encodeURIComponent(libraryId) + "/reading_lists";
+    }
+
+    function readingListContentApi(listId) {
+      return "/v2/library/" + encodeURIComponent(libraryId) + "/reading_list/" + encodeURIComponent(listId) + "/content";
+    }
+
+    function readingListUrl(listId) {
+      return libraryUrl() + "?list=" + encodeURIComponent(listId);
+    }
+
+    function sortControl(onChange) {
+      var row = element("div", "browser-sort-row");
+      var label = element("label", "browser-sort-label", "Sort by");
+      var select = document.createElement("select");
+      select.className = "browser-sort-select";
+      [
+        ["default", "Default order"],
+        ["added_desc", "Newest added"],
+        ["added_asc", "Oldest added"],
+        ["updated_desc", "Recently updated"],
+        ["updated_asc", "Least recently updated"],
+        ["name_asc", "Name A–Z"],
+        ["name_desc", "Name Z–A"]
+      ].forEach(function (option) {
+        var node = document.createElement("option");
+        node.value = option[0];
+        node.textContent = option[1];
+        select.appendChild(node);
+      });
+      select.value = getSortMode();
+      select.addEventListener("change", function () {
+        setSortMode(select.value);
+        onChange();
+      });
+      label.appendChild(select);
+      row.appendChild(label);
+      return row;
+    }
+
+    function readingListsShelf(lists) {
+      var shelf = element("section", "reading-lists-shelf");
+      shelf.appendChild(element("h3", "", "Reading lists"));
+      var row = element("div", "reading-lists-row");
+      lists.forEach(function (list) {
+        var link = element("a", "reading-list-chip", list.reading_list_name || "Untitled list");
+        link.href = readingListUrl(String(list.id));
+        link.addEventListener("click", function (event) {
+          if (!shouldHandleInAppLink(event)) {
+            return;
+          }
+          event.preventDefault();
+          showReadingList(String(list.id), true);
+        });
+        row.appendChild(link);
+      });
+      shelf.appendChild(row);
+      return shelf;
+    }
+
+    function showReadingList(listId, pushHistory) {
+      startHistoryNavigation(pushHistory);
+      leaveReader();
+      setSearchVisible(false);
+      var version = ++navigationVersion;
+      showNavigationLoading();
+
+      Promise.all([
+        fetchJson(readingListsApi()),
+        fetchJson(readingListContentApi(listId))
+      ]).then(function (results) {
+        if (version !== navigationVersion) {
+          return;
+        }
+
+        var list = results[0].filter(function (entry) {
+          return String(entry.id) === String(listId);
+        })[0];
+        var listName = list && list.reading_list_name ? list.reading_list_name : "Reading list";
+        var mode = getSortMode();
+        // "default" keeps the order of the list itself
+        var items = mode === "default" ? results[1] : sortBrowserItems(results[1], mode);
+
+        setPageHeading(listName);
+        setBrowserBack("1");
+        renderBreadcrumbs([
+          { label: "Libraries", href: "/webui#libraries" },
+          {
+            label: libraryName,
+            href: libraryUrl(),
+            action: function () { showFolder("1", true); }
+          },
+          { label: listName }
+        ]);
+
+        browserRoot.removeAttribute("aria-busy");
+        browserRoot.replaceChildren();
+
+        var header = element("section", "browser-library-header");
+        header.appendChild(element("div", "section-title", "Reading list"));
+        header.appendChild(element("h2", "", listName));
+        header.appendChild(element("p", "", items.length === 1 ? "1 comic" : items.length + " comics"));
+        if (items.length > 1) {
+          header.appendChild(sortControl(function () {
+            showReadingList(listId, false);
+          }));
+        }
+        browserRoot.appendChild(header);
+
+        if (!items.length) {
+          var empty = element("div", "browser-state compact");
+          empty.appendChild(element("div", "browser-state-icon folder-state-icon"));
+          empty.appendChild(element("h2", "", "This list is empty"));
+          empty.appendChild(element("p", "", "There are no comics in this reading list yet."));
+          browserRoot.appendChild(empty);
+        } else {
+          var grid = element("div", "browser-grid");
+          items.forEach(function (item) {
+            if (item.type === "comic") {
+              grid.appendChild(comicCard(item));
+            }
+          });
+          browserRoot.appendChild(grid);
+        }
+
+        finishHistoryNavigation({ view: "list", itemId: listId }, readingListUrl(listId), pushHistory, version);
+      }).catch(function () {
+        if (version !== navigationVersion) {
+          return;
+        }
+        showError(function () {
+          showReadingList(listId, false);
+        });
+      });
+    }
+
     function showFolder(folderId, pushHistory, enteredFromFolderId, returnToCard) {
       startHistoryNavigation(pushHistory, returnToCard);
       leaveReader();
@@ -1753,7 +1934,7 @@
           return;
         }
 
-        var items = sortBrowserItems(results[0]);
+        var items = sortBrowserItems(results[0], getSortMode());
         var trail = results[1];
         var continueReading = results[2].filter(function (item) { return item.type === "comic"; });
         var folderName = trail.length ? trail[trail.length - 1].name : libraryName;
@@ -1791,7 +1972,47 @@
           summaryParts.push(comics.length === 1 ? "1 comic" : comics.length + " comics");
         }
         header.appendChild(element("p", "", summaryParts.join(" · ") || "No items"));
+                if (items.length > 1) {
+          var sortRow = element("div", "browser-sort-row");
+          var sortLabel = element("label", "browser-sort-label", "Sort by");
+          var sortSelect = document.createElement("select");
+          sortSelect.className = "browser-sort-select";
+          [
+            ["default", "Default"],
+            ["added_desc", "Newest added"],
+            ["added_asc", "Oldest added"],
+            ["updated_desc", "Recently updated"],
+            ["updated_asc", "Least recently updated"],
+            ["name_asc", "Name A–Z"],
+            ["name_desc", "Name Z–A"]
+          ].forEach(function (option) {
+            var node = document.createElement("option");
+            node.value = option[0];
+            node.textContent = option[1];
+            sortSelect.appendChild(node);
+          });
+          sortSelect.value = getSortMode();
+          sortSelect.addEventListener("change", function () {
+            setSortMode(sortSelect.value);
+            showFolder(folderId, false);
+          });
+          sortLabel.appendChild(sortSelect);
+          sortRow.appendChild(sortLabel);
+          header.appendChild(sortRow);
+        }
         browserRoot.appendChild(header);
+
+        if (folderId === "1") {
+          var listsSlot = element("div", "reading-lists-slot");
+          browserRoot.appendChild(listsSlot);
+          fetchJson(readingListsApi()).then(function (lists) {
+            if (version !== navigationVersion || !lists.length) {
+              return;
+            }
+            listsSlot.appendChild(readingListsShelf(lists));
+          }).catch(function () {
+          });
+        }
 
         if (continueReading.length) {
           browserRoot.appendChild(continueReadingShelf(continueReading));
@@ -2680,6 +2901,10 @@
       if (query && query.trim()) {
         return { view: "search", query: query.trim() };
       }
+      var listParam = new URL(window.location.href).searchParams.get("list");
+      if (listParam && /^[0-9]+$/.test(listParam)) {
+        return { view: "list", itemId: listParam };
+      }
       var escapedLibraryId = libraryId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
       var match = window.location.pathname.match(new RegExp("^/webui/library/" + escapedLibraryId + "(?:/(folder|comic)/([0-9]+)(?:/(read))?)?/?$"));
       if (!match) {
@@ -2694,6 +2919,8 @@
     function showRoute(route) {
       if (route.view === "search") {
         showSearch(route.query, false);
+      } else if (route.view === "list") {
+        showReadingList(route.itemId, false);
       } else if (route.view === "reader") {
         showReader(route.itemId, false);
       } else if (route.view === "comic") {
@@ -2730,6 +2957,8 @@
     var initialRoute = routeFromLocation();
     if (initialRoute.view === "search") {
       showSearch(initialRoute.query, false);
+    } else if (initialRoute.view === "list") {
+      showReadingList(initialRoute.itemId, false);
     } else if (initialView === "reader") {
       showReader(initialItemId, false);
     } else if (initialView === "comic") {
